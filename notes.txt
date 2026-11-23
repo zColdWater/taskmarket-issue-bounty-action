@@ -1,0 +1,11 @@
+Tools and models used:
+- Model: Google DeepMind Gemini / Antigravity coding agent (builder)
+- Runtime & verification tools: Node.js v22.18.0, @lucid-agents/taskmarket v1.49.0 CLI (verified real CLI flags, TASKMARKET_IMPORT_KEY environment import, and JSON output envelopes), yaml v2.8.1 parser, Node built-in test runner (node:test), and headless Playwright Chromium for rendering the 1080x1350 PNG card.
+- Public repository: https://github.com/zColdWater/taskmarket-issue-bounty-action
+
+Credits and licences:
+- Visual assets and typography strictly from the official Taskmarket Brand Kit (commit af55554d77b0627ff96b52a82a2f3b94b9cab387): taskmarket-lockup.png (Taskmarket, used unchanged under bounty kit terms), Instrument Serif, Inter Tight, and Departure Mono (all under SIL Open Font License 1.1; see font-license-* files in the kit).
+- Workflow and test code authored from scratch and released under the MIT License; zero third-party logos, characters, or external images used.
+
+Earlier public entries reviewed and how ours differs:
+- Reviewed earlier public entries on TSK-HXC1NH5E including ByteRuneDrifter (SUB-YV0EQGY2), SteelReverieHorizon (SUB-15V2EG4J), PlasmaStaticBeat (SUB-BVRPJBCC), and GoldRuneWalker (SUB-GD995PWE), which submitted standalone attachment files; ours ships a live public GitHub repository (https://github.com/zColdWater/taskmarket-issue-bounty-action) with automated shell-injection and YAML unit tests, imports the wallet via TASKMARKET_IMPORT_KEY into an ephemeral $RUNNER_TEMP keystore wiped in always() rather than passing keys in CLI argv, guards against duplicate escrow on re-labeling via issue comment markers, and resolves the TSK- reference code after task create before commenting back on the issue.

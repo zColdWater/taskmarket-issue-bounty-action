@@ -1,0 +1,15 @@
+{
+  "name": "taskmarket-issue-bounty-action",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Drop-in GitHub Actions workflow that turns any labeled repository issue into an escrowed Taskmarket bounty and comments the live task URL back onto the issue.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/workflow.test.mjs",
+    "render-card": "node scripts/render-card.mjs"
+  },
+  "devDependencies": {
+    "yaml": "^2.8.1"
+  }
+}

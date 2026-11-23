@@ -1,0 +1,403 @@
+name: Post Taskmarket Bounty
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "GitHub issue number to turn into a Taskmarket bounty"
+        required: true
+        type: number
+      reward:
+        description: "Optional reward override in the network payment token (e.g. 5)"
+        required: false
+        type: string
+      duration:
+        description: "Optional duration override in hours (default: 72)"
+        required: false
+        type: string
+      mode:
+        description: "Task mode: bounty, claim, pitch, benchmark, auction"
+        required: false
+        default: "bounty"
+        type: choice
+        options: [bounty, claim, pitch, benchmark, auction]
+      dry_run:
+        description: "Validate configuration and print CLI command without locking escrow"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: taskmarket-bounty-${{ github.repository }}-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  post-bounty:
+    name: Create Taskmarket Bounty
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' &&
+       (github.event.label.name == 'taskmarket' ||
+        startsWith(github.event.label.name, 'taskmarket:')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Parse issue and validate bounty configuration
+        id: parse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          INPUT_REWARD: ${{ inputs.reward }}
+          INPUT_DURATION: ${{ inputs.duration }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          VAR_NETWORK: ${{ secrets.TASKMARKET_NETWORK || vars.TASKMARKET_NETWORK }}
+          VAR_DEFAULT_REWARD: ${{ vars.TASKMARKET_DEFAULT_REWARD }}
+          VAR_DEFAULT_DURATION: ${{ vars.TASKMARKET_DEFAULT_DURATION }}
+          VAR_DEFAULT_MODE: ${{ vars.TASKMARKET_DEFAULT_MODE }}
+          VAR_REQUIRE_VERIFIED: ${{ vars.TASKMARKET_REQUIRE_VERIFIED }}
+          VAR_DRY_RUN: ${{ vars.TASKMARKET_DRY_RUN }}
+        run: |
+          node --input-type=module <<'EOF'
+          import fs from "node:fs";
+          import path from "node:path";
+          import { execFileSync } from "node:child_process";
+
+          const VALID_NETWORKS = new Set([
+            "tempo", "tempo-testnet", "base", "base-sepolia",
+            "robinhood", "robinhood-testnet", "solana", "solana-devnet"
+          ]);
+          const VALID_MODES = new Set(["bounty", "claim", "pitch", "benchmark", "auction"]);
+
+          function writeOutputs(entries) {
+            const outPath = process.env.GITHUB_OUTPUT;
+            if (!outPath) return;
+            const lines = Object.entries(entries).map(([k, v]) => `${k}=${String(v ?? "")}`);
+            fs.appendFileSync(outPath, lines.join("\n") + "\n");
+          }
+
+          let issue;
+          if (process.env.EVENT_NAME === "workflow_dispatch") {
+            const num = Number(process.env.INPUT_ISSUE_NUMBER);
+            if (!Number.isInteger(num) || num <= 0) {
+              throw new Error(`Invalid issue_number: ${process.env.INPUT_ISSUE_NUMBER}`);
+            }
+            const raw = execFileSync(
+              "gh",
+              ["api", `repos/${process.env.REPO}/issues/${num}`],
+              { encoding: "utf8" }
+            );
+            issue = JSON.parse(raw);
+          } else {
+            const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+            issue = event.issue;
+          }
+
+          if (!issue || !issue.number) {
+            throw new Error("Could not load GitHub issue payload.");
+          }
+          if (issue.pull_request) {
+            console.log(`Issue #${issue.number} is a pull request; skipping.`);
+            writeOutputs({ skip: "true", skip_reason: "pull_request" });
+            process.exit(0);
+          }
+
+          let comments = [];
+          if (process.env.MOCK_COMMENTS_JSON) {
+            comments = JSON.parse(process.env.MOCK_COMMENTS_JSON);
+          } else if (process.env.GH_TOKEN && process.env.REPO) {
+            const rawComments = execFileSync(
+              "gh",
+              ["api", `repos/${process.env.REPO}/issues/${issue.number}/comments?per_page=100`],
+              { encoding: "utf8" }
+            );
+            comments = JSON.parse(rawComments);
+          }
+
+          const existing = comments.find(
+            (c) => typeof c?.body === "string" && c.body.includes("<!-- taskmarket-bounty-posted:")
+          );
+          if (existing) {
+            console.log(`Issue #${issue.number} already has an active Taskmarket bounty comment; skipping.`);
+            writeOutputs({ skip: "true", skip_reason: "already_posted" });
+            process.exit(0);
+          }
+
+          const body = String(issue.body ?? "");
+          const readDirective = (key) => {
+            const re = new RegExp(`^\\s*taskmarket-${key}\\s*:\\s*([^\\r\\n#]+)`, "im");
+            const m = body.match(re);
+            return m ? m[1].trim() : "";
+          };
+
+          const labelName = String(process.env.LABEL_NAME ?? "").trim();
+          const labelReward = labelName.startsWith("taskmarket:")
+            ? labelName.slice("taskmarket:".length).trim()
+            : "";
+
+          const dryRun =
+            process.env.EVENT_NAME === "workflow_dispatch"
+              ? process.env.INPUT_DRY_RUN === "true"
+              : String(process.env.VAR_DRY_RUN ?? "false").toLowerCase() === "true";
+
+          const network = (
+            readDirective("network") ||
+            process.env.VAR_NETWORK ||
+            (dryRun ? "tempo" : "")
+          ).trim().toLowerCase();
+
+          if (!network) {
+            throw new Error(
+              "Missing TASKMARKET_NETWORK. Set repository secret or variable TASKMARKET_NETWORK (e.g. tempo or base)."
+            );
+          }
+          if (!VALID_NETWORKS.has(network)) {
+            throw new Error(`Unsupported Taskmarket network "${network}".`);
+          }
+
+          const rewardRaw = (
+            process.env.INPUT_REWARD ||
+            labelReward ||
+            readDirective("reward") ||
+            process.env.VAR_DEFAULT_REWARD ||
+            "5"
+          ).trim();
+          const rewardNum = Number(rewardRaw);
+          if (!Number.isFinite(rewardNum) || rewardNum <= 0) {
+            throw new Error(`Invalid reward amount "${rewardRaw}". Expected a positive number (e.g. 5).`);
+          }
+
+          const durationRaw = (
+            process.env.INPUT_DURATION ||
+            readDirective("duration") ||
+            process.env.VAR_DEFAULT_DURATION ||
+            "72"
+          ).trim();
+          const durationHours = Number(durationRaw);
+          if (!Number.isInteger(durationHours) || durationHours < 1 || durationHours > 2160) {
+            throw new Error(`Invalid duration "${durationRaw}". Expected integer hours between 1 and 2160.`);
+          }
+
+          const mode = (
+            process.env.INPUT_MODE ||
+            readDirective("mode") ||
+            process.env.VAR_DEFAULT_MODE ||
+            "bounty"
+          ).trim().toLowerCase();
+          if (!VALID_MODES.has(mode)) {
+            throw new Error(`Invalid task mode "${mode}".`);
+          }
+
+          const requireVerified = (
+            readDirective("require-verified") ||
+            process.env.VAR_REQUIRE_VERIFIED ||
+            ""
+          ).trim();
+
+          const issueUrl =
+            issue.html_url || `${process.env.SERVER_URL || "https://github.com"}/${process.env.REPO}/issues/${issue.number}`;
+          const trimmedBody = body.trim() || "(No additional issue body provided.)";
+          const description = [
+            `${String(issue.title ?? "").trim()} (${process.env.REPO}#${issue.number})`,
+            "",
+            `Source GitHub issue: ${issueUrl}`,
+            "",
+            trimmedBody,
+            "",
+            "Submit a pull request or patch referencing the GitHub issue and attach your deliverable via the Taskmarket CLI."
+          ].join("\n");
+
+          const tempDir = process.env.RUNNER_TEMP || "/tmp";
+          const descFile = path.join(tempDir, "taskmarket-description.txt");
+          fs.writeFileSync(descFile, description, "utf8");
+
+          writeOutputs({
+            skip: "false",
+            dry_run: dryRun ? "true" : "false",
+            issue_number: String(issue.number),
+            issue_url: issueUrl,
+            network,
+            reward: String(rewardRaw),
+            duration: String(durationHours),
+            mode,
+            require_verified: requireVerified,
+            description_file: descFile
+          });
+          EOF
+
+      - name: Install Taskmarket CLI
+        if: steps.parse.outputs.skip != 'true'
+        run: |
+          npm i -g @lucid-agents/taskmarket
+          taskmarket --version
+
+      - name: Dry-run preview (no escrow locked)
+        if: steps.parse.outputs.skip != 'true' && steps.parse.outputs.dry_run == 'true'
+        env:
+          NETWORK: ${{ steps.parse.outputs.network }}
+          REWARD: ${{ steps.parse.outputs.reward }}
+          DURATION: ${{ steps.parse.outputs.duration }}
+          MODE: ${{ steps.parse.outputs.mode }}
+          REQUIRE_VERIFIED: ${{ steps.parse.outputs.require_verified }}
+          DESC_FILE: ${{ steps.parse.outputs.description_file }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.issue_number }}
+        run: |
+          VERIFY_FLAG=""
+          if [ -n "$REQUIRE_VERIFIED" ]; then
+            VERIFY_FLAG="--require-verified $REQUIRE_VERIFIED"
+          fi
+          echo "Dry-run enabled for issue #$ISSUE_NUMBER. No wallet imported and no funds locked."
+          echo "Command preview:"
+          echo "taskmarket --network $NETWORK task create --description \"\$(cat \$DESC_FILE)\" --reward $REWARD --duration $DURATION --mode $MODE --tags github,open-source $VERIFY_FLAG"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "### Taskmarket Dry-Run Preview (Issue #${ISSUE_NUMBER})"
+              echo ""
+              echo "| Field | Value |"
+              echo "| --- | --- |"
+              echo "| Network | \`${NETWORK}\` |"
+              echo "| Reward | \`${REWARD}\` |"
+              echo "| Duration (hours) | \`${DURATION}\` |"
+              echo "| Mode | \`${MODE}\` |"
+              echo "| Verified gate | \`${REQUIRE_VERIFIED:-none}\` |"
+              echo ""
+              echo "\`\`\`bash"
+              echo "taskmarket --network ${NETWORK} task create --description \"\$(cat taskmarket-description.txt)\" --reward ${REWARD} --duration ${DURATION} --mode ${MODE} --tags github,open-source${VERIFY_FLAG:+ $VERIFY_FLAG}"
+              echo "\`\`\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Create escrowed Taskmarket bounty
+        id: create
+        if: steps.parse.outputs.skip != 'true' && steps.parse.outputs.dry_run != 'true'
+        env:
+          TASKMARKET_HOME: ${{ runner.temp }}/taskmarket-keystore
+          TASKMARKET_NETWORK: ${{ steps.parse.outputs.network }}
+          TASKMARKET_IMPORT_KEY: ${{ secrets.TASKMARKET_PRIVATE_KEY }}
+          REWARD: ${{ steps.parse.outputs.reward }}
+          DURATION: ${{ steps.parse.outputs.duration }}
+          MODE: ${{ steps.parse.outputs.mode }}
+          REQUIRE_VERIFIED: ${{ steps.parse.outputs.require_verified }}
+          DESC_FILE: ${{ steps.parse.outputs.description_file }}
+        run: |
+          if [ -z "${TASKMARKET_IMPORT_KEY:-}" ]; then
+            echo "::error::Missing TASKMARKET_PRIVATE_KEY secret. Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          mkdir -p "$TASKMARKET_HOME"
+          chmod 700 "$TASKMARKET_HOME"
+
+          # Import wallet from TASKMARKET_IMPORT_KEY env var without exposing key in process arguments
+          taskmarket --network "$TASKMARKET_NETWORK" wallet import --yes >/dev/null
+
+          node --input-type=module <<'EOF'
+          import fs from "node:fs";
+          import { execFileSync } from "node:child_process";
+
+          const network = process.env.TASKMARKET_NETWORK;
+          const description = fs.readFileSync(process.env.DESC_FILE, "utf8");
+          const args = [
+            "--network", network,
+            "task", "create",
+            "--description", description,
+            "--reward", process.env.REWARD,
+            "--duration", process.env.DURATION,
+            "--mode", process.env.MODE,
+            "--tags", "github,open-source"
+          ];
+          if (process.env.REQUIRE_VERIFIED) {
+            args.push("--require-verified", process.env.REQUIRE_VERIFIED);
+          }
+
+          const createOut = execFileSync("taskmarket", args, { encoding: "utf8" });
+          const created = JSON.parse(createOut);
+          if (!created?.ok || !created?.data?.taskId) {
+            throw new Error(`taskmarket task create failed: ${createOut}`);
+          }
+
+          const taskId = created.data.taskId;
+          let referenceCode = "";
+          try {
+            const getOut = execFileSync(
+              "taskmarket",
+              ["--network", network, "task", "get", taskId],
+              { encoding: "utf8" }
+            );
+            const detail = JSON.parse(getOut);
+            referenceCode = detail?.data?.referenceCode || "";
+          } catch {
+            // Task is created on-chain even if indexer listing lags briefly
+          }
+
+          const slug = referenceCode || taskId;
+          const taskUrl = `https://taskmarket.dev/tasks/${slug}`;
+          const lines = [
+            `task_id=${taskId}`,
+            `reference_code=${referenceCode}`,
+            `task_url=${taskUrl}`
+          ];
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, lines.join("\n") + "\n");
+          console.log(`Created Taskmarket bounty ${referenceCode || taskId}: ${taskUrl}`);
+          EOF
+
+      - name: Comment live Taskmarket link on GitHub issue
+        if: >-
+          steps.parse.outputs.skip != 'true' &&
+          steps.parse.outputs.dry_run != 'true' &&
+          steps.create.outputs.task_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.issue_number }}
+          NETWORK: ${{ steps.parse.outputs.network }}
+          REWARD: ${{ steps.parse.outputs.reward }}
+          DURATION: ${{ steps.parse.outputs.duration }}
+          MODE: ${{ steps.parse.outputs.mode }}
+          TASK_ID: ${{ steps.create.outputs.task_id }}
+          REF_CODE: ${{ steps.create.outputs.reference_code }}
+          TASK_URL: ${{ steps.create.outputs.task_url }}
+        run: |
+          TOKEN_NAME="payment token"
+          if [ "$NETWORK" = "tempo" ] || [ "$NETWORK" = "tempo-testnet" ]; then
+            TOKEN_NAME="OUSD"
+          elif [ "$NETWORK" = "base" ] || [ "$NETWORK" = "base-sepolia" ]; then
+            TOKEN_NAME="USDC"
+          fi
+          TARGET_REF="${REF_CODE:-$TASK_ID}"
+          COMMENT_FILE="$RUNNER_TEMP/taskmarket-comment.md"
+          cat > "$COMMENT_FILE" <<EOF
+          <!-- taskmarket-bounty-posted:${TASK_ID} -->
+          ### Taskmarket bounty live
+
+          Reward held in escrow on **${NETWORK}**: **${REWARD} ${TOKEN_NAME}** (${MODE} mode, ${DURATION}h window).
+
+          - **Task link:** ${TASK_URL}
+          - **Task ID:** \`${TASK_ID}\`${REF_CODE:+ ($REF_CODE)}
+
+          Inspect or submit with the Taskmarket CLI:
+          \`\`\`bash
+          npm i -g @lucid-agents/taskmarket
+          taskmarket --network ${NETWORK} task get ${TARGET_REF}
+          taskmarket --network ${NETWORK} task submit ${TASK_ID} --file ./deliverable.zip
+          \`\`\`
+          EOF
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file "$COMMENT_FILE"
+
+      - name: Wipe ephemeral keystore
+        if: always()
+        run: |
+          rm -rf "${{ runner.temp }}/taskmarket-keystore" "${{ runner.temp }}/taskmarket-description.txt" "${{ runner.temp }}/taskmarket-comment.md"*
